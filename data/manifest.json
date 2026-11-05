@@ -1,0 +1,13 @@
+{
+    "source": "scikit-learn load_digits",
+    "sklearn_version": "1.9.1",
+    "split_rule": "Stratified split: test=20% first, then val=25% of remaining data",
+    "split_seed": 0,
+    "sizes": {
+        "total": 1797,
+        "train": 1077,
+        "val": 360,
+        "test": 360
+    },
+    "sha256": "b0eb6bf21647de04c9bdd8dd4f2abf91709f0c3ef9b3894746cd3803802b377b"
+}
