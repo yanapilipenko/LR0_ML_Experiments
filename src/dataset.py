@@ -135,3 +135,76 @@ def create_dataset_split():
 if __name__ == "__main__":
     create_dataset_split()
 
+
+import torch
+from torch.utils.data import TensorDataset, DataLoader
+
+
+def get_dataloaders(seed=0, batch_size=64):
+    """
+    Загружает train, val и test
+    и создаёт DataLoader для каждой выборки.
+    """
+
+    # Загружаем исходные данные
+    digits = load_digits()
+
+    X = digits.data.astype(np.float32)
+    y = digits.target.astype(np.int64)
+
+    # Масштабируем признаки от 0 до 1
+    # Исходный диапазон: 0...16
+    X = X / 16.0
+
+    # Загружаем индексы разбиения
+    with open(SPLIT_PATH, "r", encoding="utf-8") as file:
+        split_data = json.load(file)
+
+    train_idx = np.array(split_data["train"])
+    val_idx = np.array(split_data["val"])
+    test_idx = np.array(split_data["test"])
+
+    # Создаём TensorDataset
+    train_dataset = TensorDataset(
+        torch.tensor(X[train_idx]),
+        torch.tensor(y[train_idx])
+    )
+
+    val_dataset = TensorDataset(
+        torch.tensor(X[val_idx]),
+        torch.tensor(y[val_idx])
+    )
+
+    test_dataset = TensorDataset(
+        torch.tensor(X[test_idx]),
+        torch.tensor(y[test_idx])
+    )
+
+    # Фиксируем генератор перемешивания
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+
+    # Создаём DataLoader
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=generator,
+        num_workers=0
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0
+    )
+
+    return train_loader, val_loader, test_loader
