@@ -7,6 +7,7 @@ import sys
 import time
 import traceback
 import hashlib
+import mlflow
 
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,7 @@ from src.utils import set_seed, get_device
 # Корневая папка проекта
 PROJECT_ROOT = Path(__file__).resolve().parent
 RUNS_DIR = PROJECT_ROOT / "runs"
+MLFLOW_DIR = PROJECT_ROOT / "mlruns"
 
 
 def get_commit():
@@ -202,10 +204,66 @@ def train(config_path, seed_override=None, eval_test=False):
 
     save_json(run_dir / "metadata.json", metadata)
 
+    mlflow_started = False
+
     try:
 
-        # Сохраняем итоговую конфигурацию
-        with open(run_dir / "config.yaml", "w", encoding="utf-8") as file:
+        # -------------------------------------------------
+        # 1. НАСТРОЙКА MLFLOW
+        # -------------------------------------------------
+
+        # Локальное хранилище MLflow
+        MLFLOW_DIR.mkdir(parents=True, exist_ok=True)
+
+        mlflow.set_tracking_uri(MLFLOW_DIR.resolve().as_uri())
+
+        # Эксперимент лабораторной работы
+        mlflow.set_tracking_uri("sqlite:///mlflow.db")
+        mlflow.set_experiment("LR0_Digits")
+
+        # Создаём отдельный запуск MLflow
+        mlflow.start_run(run_name=run_id)
+        mlflow_started = True
+
+        # Теги запуска
+        mlflow.set_tags({
+            "commit": str(metadata["commit"] or "unknown"),
+            "series": str(config["experiment"]),
+            "seed": str(seed),
+            "split_sha256": split_hash,
+            "local_run_id": run_id,
+            "status": "running"
+        })
+
+        # Параметры модели и обучения
+        mlflow.log_params({
+            "experiment": str(config["experiment"]),
+            "split_seed": str(config["split_seed"]),
+            "seed": str(seed),
+
+            "model.n_layers": config["model"]["n_layers"],
+            "model.hidden": config["model"]["hidden"],
+            "model.dropout": config["model"]["dropout"],
+
+            "train.lr": config["train"]["lr"],
+            "train.weight_decay": config["train"]["weight_decay"],
+            "train.batch_size": config["train"]["batch_size"],
+            "train.epochs": config["train"]["epochs"],
+
+            "runtime.device": str(config["runtime"]["device"]),
+            "runtime.num_threads": num_threads
+        })
+
+        # -------------------------------------------------
+        # 2. СОХРАНЕНИЕ КОНФИГУРАЦИИ
+        # -------------------------------------------------
+
+        with open(
+            run_dir / "config.yaml",
+            "w",
+            encoding="utf-8"
+        ) as file:
+
             yaml.safe_dump(
                 config,
                 file,
@@ -213,28 +271,36 @@ def train(config_path, seed_override=None, eval_test=False):
                 sort_keys=False
             )
 
-        # Загружаем данные
+        # -------------------------------------------------
+        # 3. ЗАГРУЗКА ДАННЫХ
+        # -------------------------------------------------
+
         train_loader, val_loader, test_loader = get_dataloaders(
             seed=seed,
             batch_size=config["train"]["batch_size"]
         )
 
-        # Создаём модель
+        # -------------------------------------------------
+        # 4. СОЗДАНИЕ МОДЕЛИ
+        # -------------------------------------------------
+
         model = DigitsClassifier(
             n_layers=config["model"]["n_layers"],
             hidden=config["model"]["hidden"],
             dropout=config["model"]["dropout"]
         ).to(device)
 
-        # Функция потерь
         criterion = nn.CrossEntropyLoss()
 
-        # Оптимизатор Adam
         optimizer = torch.optim.Adam(
             model.parameters(),
             lr=config["train"]["lr"],
             weight_decay=config["train"]["weight_decay"]
         )
+
+        # -------------------------------------------------
+        # 5. ОБУЧЕНИЕ
+        # -------------------------------------------------
 
         history_path = run_dir / "history.csv"
 
@@ -246,8 +312,12 @@ def train(config_path, seed_override=None, eval_test=False):
             "epoch_time"
         ]
 
-        # Создаём CSV с заголовком
-        with open(history_path, "w", newline="", encoding="utf-8") as file:
+        with open(
+            history_path,
+            "w",
+            newline="",
+            encoding="utf-8"
+        ) as file:
 
             writer = csv.DictWriter(
                 file,
@@ -260,7 +330,6 @@ def train(config_path, seed_override=None, eval_test=False):
         print(f"Устройство: {device}")
         print(f"Seed: {seed}")
 
-        # Обучение на протяжении 30 эпох
         for epoch in range(1, config["train"]["epochs"] + 1):
 
             epoch_start = time.perf_counter()
@@ -286,7 +355,7 @@ def train(config_path, seed_override=None, eval_test=False):
 
             epoch_time = time.perf_counter() - epoch_start
 
-            # Дописываем результат каждой эпохи
+            # Сохраняем историю локально
             with open(
                 history_path,
                 "a",
@@ -307,6 +376,15 @@ def train(config_path, seed_override=None, eval_test=False):
                     "epoch_time": epoch_time
                 })
 
+            # Записываем метрики эпохи в MLflow
+            mlflow.log_metrics({
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "epoch_time": epoch_time
+            }, step=epoch)
+
             print(
                 f"Epoch {epoch:02d}/30 | "
                 f"train_loss={train_loss:.4f} | "
@@ -314,7 +392,10 @@ def train(config_path, seed_override=None, eval_test=False):
                 f"val_acc={val_acc:.4f}"
             )
 
-        # Получаем окончательные предсказания на validation
+        # -------------------------------------------------
+        # 6. ПРЕДСКАЗАНИЯ НА VALIDATION
+        # -------------------------------------------------
+
         val_loss, val_true, val_pred = evaluate(
             model,
             val_loader,
@@ -322,7 +403,6 @@ def train(config_path, seed_override=None, eval_test=False):
             device
         )
 
-        # Загружаем исходные индексы
         with open(SPLIT_PATH, "r", encoding="utf-8") as file:
             split_data = json.load(file)
 
@@ -358,7 +438,10 @@ def train(config_path, seed_override=None, eval_test=False):
                     "y_pred": pred
                 })
 
-        # Сохраняем предсказания
+        # -------------------------------------------------
+        # 7. СОХРАНЕНИЕ ПРЕДСКАЗАНИЙ
+        # -------------------------------------------------
+
         predictions_path = run_dir / "predictions.csv"
 
         with open(
@@ -378,39 +461,39 @@ def train(config_path, seed_override=None, eval_test=False):
             writer.writeheader()
             writer.writerows(predictions)
 
-        # Читаем историю обучения
+        # -------------------------------------------------
+        # 8. РАСЧЁТ ИТОГОВЫХ МЕТРИК
+        # -------------------------------------------------
+
         with open(history_path, "r", encoding="utf-8") as file:
             history_rows = list(csv.DictReader(file))
 
-        # Читаем сохранённые предсказания
         with open(predictions_path, "r", encoding="utf-8") as file:
             prediction_rows = list(csv.DictReader(file))
 
-        # Выделяем предсказания validation
         val_rows = [
             row for row in prediction_rows
             if row["split"] == "val"
         ]
 
         if not history_rows or not val_rows:
-            raise ValueError("История обучения или validation-предсказания пусты")
+            raise ValueError(
+                "История обучения или validation-предсказания пусты"
+            )
 
-        # Считаем точность из predictions.csv
+        # Accuracy рассчитываем по сохранённым предсказаниям
         final_val_acc = sum(
             int(row["y_true"]) == int(row["y_pred"])
             for row in val_rows
         ) / len(val_rows)
 
-        # Берём последнюю ошибку из history.csv
         final_val_loss = float(history_rows[-1]["val_loss"])
 
-        # Суммируем время всех эпох
         training_time = sum(
             float(row["epoch_time"])
             for row in history_rows
         )
 
-        # Считаем test accuracy, если тестирование выполнялось
         test_rows = [
             row for row in prediction_rows
             if row["split"] == "test"
@@ -424,7 +507,6 @@ def train(config_path, seed_override=None, eval_test=False):
                 for row in test_rows
             ) / len(test_rows)
 
-        # Сохраняем итоговые метрики
         metrics = {
             "val_acc": final_val_acc,
             "val_loss": final_val_loss,
@@ -434,10 +516,38 @@ def train(config_path, seed_override=None, eval_test=False):
 
         save_json(run_dir / "metrics.json", metrics)
 
+        # -------------------------------------------------
+        # 9. ЗАВЕРШЕНИЕ MLFLOW
+        # -------------------------------------------------
+
         metadata["status"] = "completed"
         metadata["end_time"] = datetime.now().astimezone().isoformat()
 
         save_json(run_dir / "metadata.json", metadata)
+
+        # Итоговые метрики
+        mlflow.log_metrics({
+            "final_val_acc": final_val_acc,
+            "final_val_loss": final_val_loss,
+            "training_time": training_time
+        })
+
+        if final_test_acc is not None:
+            mlflow.log_metric("test_acc", final_test_acc)
+
+        # Обновляем статус
+        mlflow.set_tag("status", "completed")
+
+        # Загружаем все файлы запуска как артефакты
+        mlflow.log_artifacts(str(run_dir))
+
+        # Завершаем запуск
+        mlflow.end_run(status="FINISHED")
+        mlflow_started = False
+
+        # -------------------------------------------------
+        # 10. ВЫВОД РЕЗУЛЬТАТОВ
+        # -------------------------------------------------
 
         print("\nОбучение завершено!")
         print(f"Validation accuracy: {final_val_acc:.4f}")
@@ -461,6 +571,22 @@ def train(config_path, seed_override=None, eval_test=False):
             encoding="utf-8"
         ) as file:
             file.write(traceback.format_exc())
+
+        # Сохраняем неудачный запуск в MLflow
+        if mlflow_started and mlflow.active_run() is not None:
+
+            try:
+                mlflow.set_tag("status", "failed")
+                mlflow.log_artifacts(str(run_dir))
+
+            except Exception as mlflow_error:
+                print(
+                    f"Ошибка журналирования MLflow: {mlflow_error}"
+                )
+
+            finally:
+                mlflow.end_run(status="FAILED")
+                mlflow_started = False
 
         raise
 
